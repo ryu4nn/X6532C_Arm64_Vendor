@@ -100,8 +100,11 @@ be used here; see `docs/64bit-feasibility.md` for the audit.
 
 ## Installation
 
-Two routes, both requiring an unlocked bootloader and verification already
-disabled for the slot (which any custom ROM on this device requires anyway).
+Two routes, both requiring an unlocked bootloader. No patched `vbmeta` is
+needed: every vbmeta image on the device carries `flags=1`
+(`AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED`), so `fs_mgr` mounts `vendor`
+without dm-verity even though the fstab entry carries the `avb` flag and the
+image no longer matches the stock root digest.
 
 ### Recovery archive (recommended)
 
@@ -109,11 +112,16 @@ disabled for the slot (which any custom ROM on this device requires anyway).
 ryu4nn-X6532C-Arm64-Vendor-<version>.zip
 ```
 
-The archive grows `vendor$SLOT` from 291 MiB to 307 MiB through the recovery's
-own `lptools` (the stock partition is too small for the added objects), maps it
-and streams the image onto it. Requires OrangeFox/TWRP built with
-`TW_INCLUDE_LPTOOLS` and `TW_INCLUDE_FASTBOOTD`, which is what
-`android_device_infinix_X6532C_ofrp` produces.
+The archive unmounts `/vendor` first, grows `vendor$SLOT` from 291 MiB to
+307 MiB through the recovery's own `lptools` (the stock partition is too small
+for the added objects), maps it and streams the image onto it. Requires
+OrangeFox/TWRP built with `TW_INCLUDE_LPTOOLS` and `TW_INCLUDE_FASTBOOTD`,
+which is what `android_device_infinix_X6532C_ofrp` produces.
+
+Only the `vendor` logical partition inside `super` is written. Recovery on
+this device lives in `vendor_boot` (there is no `recovery` partition), and
+`boot`, `vendor_boot`, `init_boot`, `dtbo`, `vbmeta`, `metadata` and
+`userdata` are left alone, so an installed OrangeFox survives the flash.
 
 ### fastbootd
 
