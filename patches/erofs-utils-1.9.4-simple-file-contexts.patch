@@ -1,0 +1,240 @@
+--- a/include/erofs/config.h
++++ b/include/erofs/config.h
+@@ -41,6 +41,8 @@
+ 
+ #ifdef HAVE_LIBSELINUX
+ 	struct selabel_handle *sehnd;
++#else
++	void *sehnd;	/* plain path -> context map, see erofs_selabel_open() */
+ #endif
+ 	/* related arguments for mkfs.erofs */
+ 	char *c_img_path;
+@@ -80,10 +82,8 @@
+ #ifdef HAVE_LIBSELINUX
+ int erofs_selabel_open(const char *file_contexts);
+ #else
+-static inline int erofs_selabel_open(const char *file_contexts)
+-{
+-	return -EINVAL;
+-}
++int erofs_selabel_open(const char *file_contexts);
++const char *erofs_selabel_lookup(void *handle, const char *path);
+ #endif
+ 
+ void erofs_update_progressinfo(const char *fmt, ...);
+--- a/lib/config.c
++++ b/lib/config.c
+@@ -18,6 +18,18 @@
+ #include <unistd.h>
+ #endif
+ 
++#ifndef HAVE_LIBSELINUX
++struct erofs_selabel_entry {
++	char *path;
++	char *ctx;
++};
++
++struct erofs_selabel_map {
++	size_t nr;
++	struct erofs_selabel_entry *ent;
++};
++#endif
++
+ struct erofs_configure cfg;
+ struct erofs_sb_info g_sbi;
+ bool erofs_stdout_tty;
+@@ -48,6 +60,18 @@
+ #ifdef HAVE_LIBSELINUX
+ 	if (cfg.sehnd)
+ 		selabel_close(cfg.sehnd);
++#else
++	if (cfg.sehnd) {
++		struct erofs_selabel_map *map = cfg.sehnd;
++		size_t i;
++
++		for (i = 0; i < map->nr; ++i) {
++			free(map->ent[i].path);
++			free(map->ent[i].ctx);
++		}
++		free(map->ent);
++		free(map);
++	}
+ #endif
+ 	if (cfg.c_img_path)
+ 		free(cfg.c_img_path);
+@@ -100,6 +124,111 @@
+ 	}
+ 	return 0;
+ }
++#else
++static int selabel_entry_cmp(const void *a, const void *b)
++{
++	return strcmp(((const struct erofs_selabel_entry *)a)->path,
++		      ((const struct erofs_selabel_entry *)b)->path);
++}
++
++/*
++ * Bare-bones replacement for libselinux' SELABEL_CTX_FILE: the contexts file
++ * is a sorted list of literal "<path> <context>" pairs and matching is exact
++ * instead of regex based.  Callers must therefore pass a file with one line
++ * per path, which is what the Android vendor tree needs.
++ */
++int erofs_selabel_open(const char *file_contexts)
++{
++	struct erofs_selabel_map *map;
++	FILE *fp;
++	char *line = NULL;
++	size_t cap = 0, alloc = 0;
++	ssize_t len;
++
++	if (cfg.sehnd) {
++		erofs_info("ignore duplicated file contexts \"%s\"",
++			   file_contexts);
++		return -EBUSY;
++	}
++	fp = fopen(file_contexts, "r");
++	if (!fp) {
++		erofs_err("failed to open file contexts \"%s\"", file_contexts);
++		return -EINVAL;
++	}
++
++	map = calloc(1, sizeof(*map));
++	if (!map) {
++		fclose(fp);
++		return -ENOMEM;
++	}
++
++	while ((len = getline(&line, &cap, fp)) > 0) {
++		char *p = line, *ctx, *end;
++
++		while (*p == ' ' || *p == '\t')
++			++p;
++		if (*p == '#' || *p == '\n' || !*p)
++			continue;
++		ctx = p;
++		while (*ctx && *ctx != ' ' && *ctx != '\t')
++			++ctx;
++		if (!*ctx)
++			continue;
++		*ctx++ = '\0';
++		while (*ctx == ' ' || *ctx == '\t')
++			++ctx;
++		end = ctx + strlen(ctx);
++		while (end > ctx && (end[-1] == '\n' || end[-1] == '\r' ||
++				     end[-1] == ' ' || end[-1] == '\t'))
++			--end;
++		*end = '\0';
++		if (!*ctx)
++			continue;
++
++		if (map->nr == alloc) {
++			struct erofs_selabel_entry *n;
++
++			alloc = alloc ? alloc * 2 : 1024;
++			n = realloc(map->ent, alloc * sizeof(*n));
++			if (!n) {
++				free(line);
++				fclose(fp);
++				free(map);
++				return -ENOMEM;
++			}
++			map->ent = n;
++		}
++		map->ent[map->nr].path = strdup(p);
++		map->ent[map->nr].ctx = strdup(ctx);
++		if (!map->ent[map->nr].path || !map->ent[map->nr].ctx) {
++			free(line);
++			fclose(fp);
++			return -ENOMEM;
++		}
++		++map->nr;
++	}
++	free(line);
++	fclose(fp);
++
++	qsort(map->ent, map->nr, sizeof(*map->ent), selabel_entry_cmp);
++	cfg.sehnd = map;
++	erofs_info("loaded %zu file context entries from \"%s\"",
++		   map->nr, file_contexts);
++	return 0;
++}
++
++const char *erofs_selabel_lookup(void *handle, const char *path)
++{
++	struct erofs_selabel_map *map = handle;
++	struct erofs_selabel_entry key, *hit;
++
++	if (!map || !map->nr)
++		return NULL;
++	key.path = (char *)path;
++	hit = bsearch(&key, map->ent, map->nr, sizeof(*map->ent),
++		      selabel_entry_cmp);
++	return hit ? hit->ctx : NULL;
++}
+ #endif
+ 
+ static bool __erofs_is_progressmsg;
+--- a/lib/xattr.c
++++ b/lib/xattr.c
+@@ -397,6 +397,39 @@
+ 			free(kvbuf);
+ 		return item;
+ 	}
++#else
++	if (cfg.sehnd) {
++		const char *secontext;
++		int ret;
++		unsigned int len[2];
++		char *kvbuf, *fspath;
++		struct erofs_xattritem *item;
++
++		if (cfg.mount_point)
++			ret = asprintf(&fspath, "/%s/%s", cfg.mount_point,
++				       erofs_fspath(srcpath));
++		else
++			ret = asprintf(&fspath, "/%s", erofs_fspath(srcpath));
++		if (ret <= 0)
++			return ERR_PTR(-ENOMEM);
++
++		secontext = erofs_selabel_lookup(cfg.sehnd, fspath);
++		free(fspath);
++		if (!secontext)
++			return NULL;
++
++		len[0] = sizeof(XATTR_NAME_SECURITY_SELINUX) - 1;
++		len[1] = strlen(secontext);
++		kvbuf = malloc(EROFS_XATTR_KVSIZE(len));
++		if (!kvbuf)
++			return ERR_PTR(-ENOMEM);
++		sprintf(kvbuf, "%s", XATTR_NAME_SECURITY_SELINUX);
++		memcpy(kvbuf + EROFS_XATTR_KSIZE(len), secontext, len[1]);
++		item = get_xattritem(sbi, kvbuf, len);
++		if (IS_ERR(item))
++			free(kvbuf);
++		return item;
++	}
+ #endif
+ 	return NULL;
+ }
+--- a/mkfs/main.c
++++ b/mkfs/main.c
+@@ -41,9 +41,7 @@
+ 	{"help", no_argument, 0, 'h'},
+ 	{"exclude-path", required_argument, NULL, 2},
+ 	{"exclude-regex", required_argument, NULL, 3},
+-#ifdef HAVE_LIBSELINUX
+ 	{"file-contexts", required_argument, NULL, 4},
+-#endif
+ 	{"force-uid", required_argument, NULL, 5},
+ 	{"force-gid", required_argument, NULL, 6},
+ 	{"all-root", no_argument, NULL, 7},
+@@ -201,9 +199,7 @@
+ 		" --dsunit=#             align all data block addresses to multiples of #\n"
+ 		" --exclude-path=X       avoid including file X (X = exact literal path)\n"
+ 		" --exclude-regex=X      avoid including files that match X (X = regular expression)\n"
+-#ifdef HAVE_LIBSELINUX
+ 		" --file-contexts=X      specify a file contexts file to setup selinux labels\n"
+-#endif
+ 		" --force-uid=#          set all file uids to # (# = UID)\n"
+ 		" --force-gid=#          set all file gids to # (# = GID)\n"
+ 		" --fsalignblks=#        specify the alignment of the primary device size in blocks\n"
