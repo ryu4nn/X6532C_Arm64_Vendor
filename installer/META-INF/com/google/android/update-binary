@@ -1,0 +1,94 @@
+#!/sbin/sh
+#
+# Arm64 hybrid vendor installer for the Infinix Smart 9 HD (X6532C).
+#
+# The vendor partition holds the 64-bit PowerVR user-mode driver plus the
+# 32-bit HALs from the stock firmware.  It is larger than the stock 305 MB
+# logical partition, so the partition is grown first and the image is then
+# streamed straight onto the mapped device.
+
+OUTFD=/proc/self/fd/$2
+ZIPFILE="$3"
+
+ui_print() {
+    echo -e "ui_print $1\nui_print" >>$OUTFD
+}
+
+fail() {
+    ui_print " "
+    ui_print "  !! $1"
+    ui_print " "
+    exit 1
+}
+
+VND_SIZE=321912832
+SLOT=$(getprop ro.boot.slot_suffix)
+[ -z "$SLOT" ] && SLOT=_a
+
+LPT=""
+for c in lptools /sbin/lptools /system/bin/lptools; do
+    if command -v "$c" >/dev/null 2>&1; then
+        LPT="$c"
+        break
+    fi
+done
+[ -z "$LPT" ] && fail "lptools not found - use the fastbootd method instead"
+
+# Prefer the bundled static xz: it is the same build the stock firmware
+# packages use and does not depend on what busybox the recovery ships.
+unzip "$ZIPFILE" META-INF/xz -d /tmp >/dev/null 2>&1
+chmod 0755 /tmp/META-INF/xz 2>/dev/null
+if [ -x /tmp/META-INF/xz ]; then
+    XZ=/tmp/META-INF/xz
+elif command -v xz >/dev/null 2>&1; then
+    XZ=xz
+else
+    fail "no xz decompressor available"
+fi
+
+DEV=/dev/block/mapper/vendor$SLOT
+
+ui_print "========================================"
+ui_print "|   Arm64 Vendor - Infinix Smart 9 HD  |"
+ui_print "|   X6532C / MT6765 / PowerVR GE8320   |"
+ui_print "========================================"
+ui_print " Current slot: ${SLOT}"
+
+# vendor may already be mounted read-only by the recovery; a busy mapped
+# device cannot be unmapped or resized.
+umount /vendor >/dev/null 2>&1
+umount -l /vendor >/dev/null 2>&1
+
+ui_print "- Releasing any snapshot for vendor${SLOT}"
+"$LPT" clear-cow vendor$SLOT >/dev/null 2>&1
+
+ui_print "- Unmapping vendor${SLOT}"
+"$LPT" unmap vendor$SLOT >/dev/null 2>&1
+
+ui_print "- Growing vendor${SLOT} to ${VND_SIZE} bytes"
+if ! "$LPT" resize vendor$SLOT $VND_SIZE; then
+    ui_print "  resize failed, recreating the partition"
+    "$LPT" remove vendor$SLOT >/dev/null 2>&1
+    "$LPT" create vendor$SLOT $VND_SIZE || fail "cannot create vendor${SLOT}"
+fi
+
+"$LPT" map vendor$SLOT || fail "cannot map vendor${SLOT}"
+
+GOT=$(blockdev --getsize64 "$DEV" 2>/dev/null)
+ui_print "- Mapped device size: ${GOT} bytes"
+[ -n "$GOT" ] && [ "$GOT" -lt "$VND_SIZE" ] && \
+    fail "vendor${SLOT} is smaller than the image, aborting"
+
+ui_print "- Writing the image, this takes a minute"
+unzip -p "$ZIPFILE" vendor.img.xz | "$XZ" -d > "$DEV" || fail "write failed"
+
+sync
+"$LPT" unmap vendor$SLOT >/dev/null 2>&1
+"$LPT" map vendor$SLOT >/dev/null 2>&1
+
+ui_print "========================================"
+ui_print "|              Finished                |"
+ui_print "|  Reboot and enjoy 64-bit userspace   |"
+ui_print "========================================"
+
+exit 0
